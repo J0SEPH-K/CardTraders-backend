@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Environment files
+.env
+.env.*
+.env.local
+.env.*.local

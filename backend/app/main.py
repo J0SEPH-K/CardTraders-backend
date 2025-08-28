@@ -1,7 +1,11 @@
 import logging
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
-from .routers import health, listings, catalog
+from .routers import health, listings, catalog, auth
+from .routers import uploaded_cards
+from .routers import images
+from .routers import tcgdex
 from .db import Base, engine
 from . import models  # noqa: F401
 from .mongo import mongo_enabled, get_mongo_db
@@ -9,9 +13,22 @@ from .mongo import mongo_enabled, get_mongo_db
 app = FastAPI(title="CardTraders API")
 logger = logging.getLogger("uvicorn.error")
 
+# Dev CORS (adjust origins for production)
+app.add_middleware(
+	CORSMiddleware,
+	allow_origins=["*"],
+	allow_credentials=True,
+	allow_methods=["*"],
+	allow_headers=["*"],
+)
+
 app.include_router(health.router, prefix="/health", tags=["health"])
 app.include_router(listings.router, prefix="/listings", tags=["listings"])
 app.include_router(catalog.router, prefix="/catalog", tags=["catalog"])
+app.include_router(tcgdex.router, prefix="/tcgdex", tags=["tcgdex"])
+app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(uploaded_cards.router, prefix="/uploaded-cards", tags=["uploaded-cards"])
+app.include_router(images.router, prefix="/images", tags=["images"])
 
 # Create tables & log DB connectivity on startup (simple dev setup; use Alembic in prod)
 @app.on_event("startup")
