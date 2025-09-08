@@ -31,8 +31,14 @@ async def get_image(image_id: str, mdb=Depends(get_mongo_db)):
         content_type = md.get("contentType")
 
     stream = await bucket.open_download_stream(oid)
-    data = await stream.read()
-    await stream.close()
+    try:
+        data = await stream.read()
+    finally:
+        # GridOut.close() is synchronous; do not await
+        try:
+            stream.close()
+        except Exception:
+            pass
     return StreamingResponse(iter([data]), media_type=content_type or "application/octet-stream")
 
 

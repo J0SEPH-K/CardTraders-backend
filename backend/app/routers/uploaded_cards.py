@@ -1,4 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Optional
+from ..db import get_db
+from sqlalchemy.orm import Session
+from ..models.payments import Payment
 import logging
 import base64
 import re
@@ -14,6 +18,37 @@ from ..mongo import get_mongo_db, mongo_enabled
 
 router = APIRouter()
 log = logging.getLogger("uvicorn.error")
+
+
+def _normalize_uploaded_card(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a shallow copy of doc with JSON-safe types for Decimal128 and datetimes."""
+    if not isinstance(doc, dict):
+        return doc
+    out = doc.copy()
+    out.pop("_id", None)
+    # uploadedBy Decimal128 -> int or string
+    if "uploadedBy" in out and out["uploadedBy"] is not None:
+        ub = out["uploadedBy"]
+        try:
+            if isinstance(ub, Decimal128):
+                out["uploadedBy"] = int(ub.to_decimal())
+            elif isinstance(ub, (int, float)):
+                out["uploadedBy"] = int(ub)
+            elif isinstance(ub, str) and ub.isdigit():
+                out["uploadedBy"] = int(ub)
+            else:
+                out["uploadedBy"] = str(ub)
+        except Exception:
+            out["uploadedBy"] = str(ub)
+    # datetimes -> ISO
+    for k in ("uploadDate", "createdAt"):
+        v = out.get(k)
+        if isinstance(v, datetime):
+            try:
+                out[k] = v.astimezone(timezone.utc).isoformat()
+            except Exception:
+                out[k] = v.isoformat()
+    return out
 
 
 async def _next_sequence(mdb, name: str) -> int:
@@ -100,7 +135,10 @@ async def list_uploaded_cards(
                 doc["uploadedBy"] = str(ub)
         # collect user ids for later lookup (int or string userId)
         if isinstance(doc.get("uploadedBy"), int):
-            user_ids.append(int(doc["uploadedBy"]))
+            val = int(doc["uploadedBy"])
+            user_ids.append(val)
+            # also track as string to match against users.userId when legacy stored as strings
+            user_ids_str.append(str(val))
         elif isinstance(doc.get("uploadedBy"), str):
             s = str(doc["uploadedBy"]).strip()
             user_ids_str.append(s)
@@ -124,7 +162,7 @@ async def list_uploaded_cards(
             # Attempt legacy numeric id match if such field exists
             decimal_ids = [Decimal128(str(uid)) for uid in uniq_ids]
             q_int = {"id": {"$in": uniq_ids + decimal_ids}}
-            async for u in users_coll.find(q_int, {"_id": 0}):
+            async for u in users_coll.find(q_int, {"_id": 0, "id": 1, "address": 1, "username": 1}):
                 raw_id = u.get("id")
                 try:
                     if isinstance(raw_id, Decimal128):
@@ -139,27 +177,48 @@ async def list_uploaded_cards(
         if user_ids_str:
             uniq_ids_str = sorted({str(uid) for uid in user_ids_str})
             q_str = {"userId": {"$in": uniq_ids_str}}
-            async for u in users_coll.find(q_str, {"_id": 0, "userId": 1, "address": 1}):
+            async for u in users_coll.find(q_str, {"_id": 0, "userId": 1, "address": 1, "username": 1}):
                 uid = u.get("userId")
                 if isinstance(uid, str):
                     user_map_str[uid] = u
 
-        # attach address if present
+        # attach address and username if present
         for d in items:
             uid = d.get("uploadedBy")
             if isinstance(uid, int) and uid in user_map_int:
                 addr = user_map_int[uid].get("address") or user_map_int[uid].get("addr") or ""
                 d["seller_address"] = addr
+                uname = user_map_int[uid].get("username")
+                if uname:
+                    d["uploadedByName"] = uname
+                    d["username"] = uname
+            elif isinstance(uid, int):
+                # fallback: try match by userId string
+                s = str(uid)
+                if s in user_map_str:
+                    addr = user_map_str[s].get("address") or ""
+                    d["seller_address"] = addr or d.get("seller_address")
+                    uname = user_map_str[s].get("username")
+                    if uname:
+                        d["uploadedByName"] = uname
+                        d["username"] = uname
             elif isinstance(uid, str) and uid in user_map_str:
                 addr = user_map_str[uid].get("address") or ""
                 d["seller_address"] = addr
+                uname = user_map_str[uid].get("username")
+                if uname:
+                    d["uploadedByName"] = uname
+                    d["username"] = uname
             elif isinstance(uid, str) and len(uid) == 24:
                 # fallback: try match by _id
                 try:
                     oid = ObjectId(uid)
-                    u = await users_coll.find_one({"_id": oid}, {"address": 1})
+                    u = await users_coll.find_one({"_id": oid}, {"address": 1, "username": 1})
                     if u and u.get("address"):
                         d["seller_address"] = u.get("address")
+                    if u and u.get("username"):
+                        d["uploadedByName"] = u.get("username")
+                        d["username"] = u.get("username")
                 except Exception:
                     pass
     except Exception:
@@ -167,6 +226,56 @@ async def list_uploaded_cards(
         pass
 
     return items
+
+
+@router.post("/{card_id}/advertise")
+async def advertise_card(
+    card_id: str,
+    payment_id: Optional[str] = None,
+    payment_reference: Optional[str] = None,
+    mdb=Depends(get_mongo_db),
+    db: Session = Depends(get_db),
+):
+    """Mark an uploaded card as advertised only after a verified payment.
+
+    To avoid accidental or optimistic advertising, this endpoint requires either
+    `payment_id` or `payment_reference` that references an existing SQL Payment
+    record with status == 'PAID' and matching item_id == card_id. This enforces
+    that advertising is only enabled after successful verification.
+    """
+    if not mongo_enabled() or mdb is None:
+        raise HTTPException(status_code=503, detail="Requires MongoDB")
+
+    # Require a payment identifier to avoid allowing arbitrary advertise calls
+    if not payment_id and not payment_reference:
+        raise HTTPException(status_code=400, detail="payment_id or payment_reference required to advertise")
+
+    # Resolve payment and verify status
+    try:
+        p = None
+        if payment_id:
+            p = db.query(Payment).filter(Payment.id == payment_id).one_or_none()
+        if not p and payment_reference:
+            p = db.query(Payment).filter(Payment.payment_reference == payment_reference).one_or_none()
+        if not p:
+            raise HTTPException(status_code=404, detail="payment not found")
+        if p.status != "PAID":
+            raise HTTPException(status_code=400, detail="payment not verified")
+        # Ensure the payment's item_id matches the card being advertised
+        if p.item_id and str(p.item_id) != str(card_id):
+            raise HTTPException(status_code=400, detail="payment does not match card id")
+
+        # Accept either integer id or string id for the document selector
+        query = {"id": int(card_id)} if str(card_id).isdigit() else {"id": card_id}
+        coll = mdb["uploadedCards"]
+        updated = await coll.find_one_and_update(query, {"$set": {"is_advertised": True}}, return_document=ReturnDocument.AFTER)
+        if not updated:
+            raise HTTPException(status_code=404, detail="card not found")
+        return _normalize_uploaded_card(updated)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/")
@@ -251,7 +360,7 @@ async def create_uploaded_card(payload: Dict[str, Any], mdb=Depends(get_mongo_db
             # ignore if cannot parse; leave out uploadedBy
             pass
 
-    # Denormalize seller address at write time for easy reads
+    # Denormalize seller address and username at write time for easy reads
     try:
         users_coll = mdb["users"]
         ub = doc.get("uploadedBy")
@@ -260,19 +369,22 @@ async def create_uploaded_card(payload: Dict[str, Any], mdb=Depends(get_mongo_db
             # try userId match; if looks like ObjectId, fallback to _id
             if len(ub) == 24:
                 try:
-                    user_doc = await users_coll.find_one({"_id": ObjectId(ub)}, {"address": 1})
+                    user_doc = await users_coll.find_one({"_id": ObjectId(ub)}, {"address": 1, "username": 1})
                 except Exception:
                     user_doc = None
             if not user_doc:
-                user_doc = await users_coll.find_one({"userId": ub}, {"address": 1})
+                user_doc = await users_coll.find_one({"userId": ub}, {"address": 1, "username": 1})
         elif isinstance(ub, Decimal128):
             # legacy numeric id path (if users schema had numeric id)
             try:
-                user_doc = await users_coll.find_one({"id": ub}, {"address": 1})
+                user_doc = await users_coll.find_one({"id": ub}, {"address": 1, "username": 1})
             except Exception:
                 user_doc = None
         if user_doc and user_doc.get("address"):
             doc["seller_address"] = user_doc.get("address")
+        if user_doc and user_doc.get("username"):
+            doc["uploadedByName"] = user_doc.get("username")
+            doc["username"] = user_doc.get("username")
     except Exception:
         pass
 
@@ -298,58 +410,58 @@ async def create_uploaded_card(payload: Dict[str, Any], mdb=Depends(get_mongo_db
             raw = base64.b64decode(s, validate=True)
         except Exception:
             raise HTTPException(status_code=400, detail="invalid image_base64")
-        try:
-            bucket = AsyncIOMotorGridFSBucket(mdb, bucket_name="uploads")
+        # Prefer local filesystem storage for predictable URLs like /images/local/uploads/<id>.jpg
+        prefer_fs = (os.getenv("PREFER_FILESYSTEM_UPLOADS", "true").lower() in ("1", "true", "yes"))
+        if prefer_fs:
             try:
-                upload_stream = await bucket.open_upload_stream(
-                    filename="card.jpg",
-                    metadata={"contentType": content_type or "image/jpeg"},
-                )
-            except TypeError:
-                # Older Motor/PyMongo versions may not support 'metadata' kw.
-                upload_stream = await bucket.open_upload_stream(
-                    filename="card.jpg",
-                )
-            await upload_stream.write(raw)
-            oid = upload_stream._id  # type: ignore[attr-defined]
-            await upload_stream.close()
-            # save references
-            doc["image_id"] = str(oid)
-            doc["image_url"] = f"/images/{str(oid)}"
-            try:
-                log.info("create_uploaded_card: stored image bytes=%s id=%s", len(raw), str(oid))
-            except Exception:
-                pass
-        except HTTPException:
-            raise
-        except Exception as e:
-            # Optionally allow filesystem fallback only if explicitly enabled
-            enable_fs = (os.getenv("ENABLE_FILESYSTEM_FALLBACK", "false").lower() in ("1", "true", "yes"))
-            if enable_fs:
+                media_root = os.getenv("MEDIA_ROOT") or str(Path(__file__).resolve().parents[2] / "media")
+                uploads_dir = Path(media_root) / "uploads"
+                uploads_dir.mkdir(parents=True, exist_ok=True)
+                # Use a random ObjectId-based filename, default jpg
+                ext = ".jpg"
+                if content_type == "image/png":
+                    ext = ".png"
+                fname = f"{ObjectId()}{ext}"
+                fpath = uploads_dir / fname
+                with open(fpath, "wb") as fh:
+                    fh.write(raw)
+                doc["image_id"] = fname
+                doc["image_url"] = f"/images/local/uploads/{fname}"
+                log.info("create_uploaded_card: stored image to filesystem path=%s", str(fpath))
+            except Exception as e2:
                 try:
-                    log.warning("GridFS store failed (%s: %s). Attempting filesystem fallback.", e.__class__.__name__, e)
-                    media_root = os.getenv("MEDIA_ROOT") or str(Path(__file__).resolve().parents[2] / "media")
-                    uploads_dir = Path(media_root) / "uploads"
-                    uploads_dir.mkdir(parents=True, exist_ok=True)
-                    # Use a random ObjectId-based filename, default jpg
-                    ext = ".jpg"
-                    if content_type == "image/png":
-                        ext = ".png"
-                    fname = f"{ObjectId()}{ext}"
-                    fpath = uploads_dir / fname
-                    with open(fpath, "wb") as fh:
-                        fh.write(raw)
-                    doc["image_id"] = fname
-                    doc["image_url"] = f"/images/local/uploads/{fname}"
-                    log.info("create_uploaded_card: stored image to filesystem path=%s", str(fpath))
-                except Exception as e2:
-                    try:
-                        log.error("filesystem store failed (%s: %s)", e2.__class__.__name__, e2)
-                    except Exception:
-                        pass
-                    raise HTTPException(status_code=500, detail=f"failed to store image: {e.__class__.__name__}: {e}")
-            else:
-                # No fallback allowed; surface GridFS failure
+                    log.error("filesystem store failed (%s: %s)", e2.__class__.__name__, e2)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail=f"failed to store image (filesystem): {e2.__class__.__name__}: {e2}")
+        else:
+            # GridFS path retained as optional alternative when explicitly configured
+            try:
+                bucket = AsyncIOMotorGridFSBucket(mdb, bucket_name="uploads")
+                # Use upload_from_stream for broad Motor compatibility (async and simple)
+                try:
+                    oid = await bucket.upload_from_stream(
+                        filename="card.jpg",
+                        source=raw,
+                        metadata={"contentType": content_type or "image/jpeg"},
+                    )
+                except TypeError:
+                    # Older Motor/PyMongo versions may not support 'metadata' kw-arg
+                    oid = await bucket.upload_from_stream(
+                        filename="card.jpg",
+                        source=raw,
+                    )
+                # save references
+                doc["image_id"] = str(oid)
+                doc["image_url"] = f"/images/{str(oid)}"
+                try:
+                    log.info("create_uploaded_card: stored image bytes=%s id=%s", len(raw), str(oid))
+                except Exception:
+                    pass
+            except HTTPException:
+                raise
+            except Exception as e:
+                # No fallback since local FS is explicitly disabled
                 raise HTTPException(status_code=500, detail=f"failed to store image (gridfs): {e.__class__.__name__}: {e}")
 
     await mdb["uploadedCards"].insert_one(doc)
@@ -370,3 +482,12 @@ async def create_uploaded_card(payload: Dict[str, Any], mdb=Depends(get_mongo_db
         if k in out and isinstance(out[k], datetime):
             out[k] = out[k].astimezone(timezone.utc).isoformat()
     return out
+
+@router.get("/{card_id}")
+async def get_uploaded_card(card_id: int, mdb=Depends(get_mongo_db)) -> Dict[str, Any]:
+    if not mongo_enabled() or mdb is None:
+        raise HTTPException(status_code=503, detail="Requires MongoDB")
+    doc = await mdb["uploadedCards"].find_one({"id": int(card_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="not found")
+    return _normalize_uploaded_card(doc)

@@ -9,6 +9,8 @@ from ..schemas.auth import LoginRequest, LoginResponse, UserPublic
 from ..services.notify import send_sms, send_email, twilio_enabled, sendgrid_enabled, sms_enabled, solapi_enabled
 import logging
 from typing import Optional, Set
+from pathlib import Path
+import base64
 
 # Google ID token verification
 try:
@@ -304,6 +306,115 @@ async def login_google(payload: dict, mdb=Depends(get_mongo_db)):
     # sanitize
     doc_id = str(doc.get("_id")) if doc.get("_id") else None
     out = doc.copy()
+    out.pop("_id", None)
+    out.pop("password", None)
+    return {"user": UserPublic(id=doc_id, **out)}
+
+
+@router.post("/update-profile", response_model=LoginResponse)
+async def update_profile(payload: dict, mdb=Depends(get_mongo_db)):
+    if not mongo_enabled() or mdb is None:
+        raise HTTPException(status_code=503, detail="Auth requires MongoDB")
+    users = mdb["users"]
+    # Identify user by id (Mongo _id) or userId or email
+    user_doc = None
+    q = None
+    id_str = payload.get("id")
+    user_id = payload.get("userId")
+    email = (payload.get("email") or "").strip().lower() or None
+    if id_str:
+        try:
+            q = {"_id": ObjectId(id_str)}
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid id")
+    elif user_id:
+        q = {"userId": str(user_id)}
+    elif email:
+        q = {"email": email}
+    else:
+        raise HTTPException(status_code=400, detail="missing identifier (id, userId, or email)")
+
+    user_doc = await users.find_one(q)
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    updates: dict = {}
+    now = datetime.now(timezone.utc)
+    # Simple fields
+    if "username" in payload:
+        updates["username"] = str(payload.get("username") or "").strip()
+    if email is not None:
+        # If changing email, ensure uniqueness
+        if email != (user_doc.get("email") or "").lower():
+            if await users.find_one({"email": email, "_id": {"$ne": user_doc["_id"]}}):
+                raise HTTPException(status_code=409, detail="Email already exists")
+            updates["email"] = email
+    if "phone_num" in payload:
+        updates["phone_num"] = str(payload.get("phone_num") or "").strip()
+    if "address" in payload:
+        updates["address"] = str(payload.get("address") or "").strip()
+    # Bank account (optional)
+    if "bank_acc" in payload:
+        # Allow clearing by sending null/empty
+        v = payload.get("bank_acc")
+        if v is None:
+            updates["bank_acc"] = None
+        else:
+            updates["bank_acc"] = str(v).strip()
+
+    # Avatar processing: accept either direct URL or image_base64; image_base64 takes precedence if present
+    image_b64 = payload.get("image_base64")
+    pfp_url = payload.get("pfp_url")
+    if isinstance(image_b64, str) and image_b64.strip():
+        s = image_b64.strip()
+        # Allow data URL or raw base64
+        try:
+            if s.startswith("data:"):
+                header, data = s.split(",", 1)
+                if ";base64" not in header:
+                    raise ValueError("not base64 data url")
+                raw = base64.b64decode(data)
+                content_type = "image/jpeg"
+                if "image/png" in header:
+                    content_type = "image/png"
+            else:
+                raw = base64.b64decode(s)
+                content_type = "image/jpeg"
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid image_base64")
+        # Save under media/uploads similar to chat attachments
+        media_root = os.getenv("MEDIA_ROOT") or str(Path(__file__).resolve().parents[2] / "media")
+        uploads_dir = Path(media_root) / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        # Pick extension
+        ext = ".jpg" if content_type == "image/jpeg" else ".png"
+        fname = f"avatar_{ObjectId()}{ext}"
+        fpath = uploads_dir / fname
+        with open(fpath, "wb") as f:
+            f.write(raw)
+        updates["pfp"] = {"url": f"/images/local/uploads/{fname}", "storage": "local"}
+    elif pfp_url is not None:
+        # Explicitly set from provided URL or clear when null
+        if pfp_url:
+            updates["pfp"] = {"url": pfp_url, "storage": "url"}
+        else:
+            updates["pfp"] = {"url": None, "storage": None}
+
+    if not updates:
+        # Nothing to change
+        # Return current doc as UserPublic
+        doc_id = str(user_doc.get("_id")) if user_doc.get("_id") else None
+        out = user_doc.copy()
+        out.pop("_id", None)
+        out.pop("password", None)
+        return {"user": UserPublic(id=doc_id, **out)}
+
+    updates["updatedAt"] = now
+    await users.update_one({"_id": user_doc["_id"]}, {"$set": updates})
+    user_doc.update(updates)
+    # Sanitize
+    doc_id = str(user_doc.get("_id")) if user_doc.get("_id") else None
+    out = user_doc.copy()
     out.pop("_id", None)
     out.pop("password", None)
     return {"user": UserPublic(id=doc_id, **out)}

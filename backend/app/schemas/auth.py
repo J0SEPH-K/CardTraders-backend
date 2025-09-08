@@ -27,6 +27,7 @@ class UserPublic(BaseModel):
     notification: Optional[bool] = True
     blocked_users: List[str] = []
     pfp: Optional[Pfp] = None
+    bank_acc: Optional[str] = None
 
 
 class LoginResponse(BaseModel):
