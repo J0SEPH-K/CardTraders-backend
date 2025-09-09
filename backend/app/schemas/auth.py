@@ -21,7 +21,8 @@ class UserPublic(BaseModel):
     address: Optional[str] = None
     signup_date: Optional[str] = None
     suggested_num: Optional[int] = 0
-    starred_item: List[str] = []
+    favorites: List[str] = []  # New standardized favorites field
+    starred_item: List[str] = []  # Legacy field for backward compatibility
     messages: Optional[list] = []
     premade_messages: List[str] = []
     notification: Optional[bool] = True

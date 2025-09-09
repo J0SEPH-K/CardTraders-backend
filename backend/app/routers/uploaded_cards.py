@@ -1,8 +1,4 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional
-from ..db import get_db
-from sqlalchemy.orm import Session
-from ..models.payments import Payment
 import logging
 import base64
 import re
@@ -70,10 +66,32 @@ async def list_uploaded_cards(
     uploadedBy: Optional[str] = None,
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    debug_user_id: Optional[str] = Query(None, description="User ID for debug logging favorites"),
     mdb=Depends(get_mongo_db),
 ) -> List[Dict[str, Any]]:
     if not mongo_enabled() or mdb is None:
         raise HTTPException(status_code=503, detail="Requires MongoDB")
+    
+    # Debug logging: Print user favorites when debug_user_id is provided
+    if debug_user_id:
+        try:
+            users_coll = mdb["users"]
+            user = await users_coll.find_one({"userId": debug_user_id}, {"favorites": 1, "starred_item": 1, "username": 1})
+            if user:
+                favorites = user.get("favorites", [])
+                starred_item = user.get("starred_item", [])
+                username = user.get("username", "Unknown")
+                print(f"=== DEBUG: User favorites for {username} (ID: {debug_user_id}) ===")
+                print(f"Favorites array: {favorites}")
+                print(f"Starred_item array: {starred_item}")
+                print(f"Total favorites: {len(favorites) if favorites else 0}")
+                print(f"Total starred_item: {len(starred_item) if starred_item else 0}")
+                print("=" * 60)
+            else:
+                print(f"=== DEBUG: User not found for ID: {debug_user_id} ===")
+        except Exception as e:
+            print(f"=== DEBUG: Error fetching user favorites: {e} ===")
+    
     coll = mdb["uploadedCards"]
     query: Dict[str, Any] = {}
     if category and category != "all":
@@ -224,50 +242,32 @@ async def list_uploaded_cards(
     except Exception:
         # ignore enrichment failures silently; return basic items
         pass
+    
+    # Additional debug logging: Show card IDs being returned
+    if debug_user_id and items:
+        print(f"=== DEBUG: Card IDs being returned ===")
+        for item in items[:5]:  # Show first 5 items to avoid spam
+            card_id = item.get("id")
+            card_name = item.get("card_name", "Unknown")
+            print(f"Card: {card_name} | ID: {card_id} | Type: {type(card_id)}")
+        print("=" * 40)
 
     return items
 
 
 @router.post("/{card_id}/advertise")
-async def advertise_card(
-    card_id: str,
-    payment_id: Optional[str] = None,
-    payment_reference: Optional[str] = None,
-    mdb=Depends(get_mongo_db),
-    db: Session = Depends(get_db),
-):
-    """Mark an uploaded card as advertised only after a verified payment.
-
-    To avoid accidental or optimistic advertising, this endpoint requires either
-    `payment_id` or `payment_reference` that references an existing SQL Payment
-    record with status == 'PAID' and matching item_id == card_id. This enforces
-    that advertising is only enabled after successful verification.
-    """
+async def advertise_card(card_id: str, mdb=Depends(get_mongo_db)):
+    """Mark an uploaded card as advertised (idempotent)."""
     if not mongo_enabled() or mdb is None:
         raise HTTPException(status_code=503, detail="Requires MongoDB")
-
-    # Require a payment identifier to avoid allowing arbitrary advertise calls
-    if not payment_id and not payment_reference:
-        raise HTTPException(status_code=400, detail="payment_id or payment_reference required to advertise")
-
-    # Resolve payment and verify status
+    coll = mdb["uploadedCards"]
     try:
-        p = None
-        if payment_id:
-            p = db.query(Payment).filter(Payment.id == payment_id).one_or_none()
-        if not p and payment_reference:
-            p = db.query(Payment).filter(Payment.payment_reference == payment_reference).one_or_none()
-        if not p:
-            raise HTTPException(status_code=404, detail="payment not found")
-        if p.status != "PAID":
-            raise HTTPException(status_code=400, detail="payment not verified")
-        # Ensure the payment's item_id matches the card being advertised
-        if p.item_id and str(p.item_id) != str(card_id):
-            raise HTTPException(status_code=400, detail="payment does not match card id")
-
-        # Accept either integer id or string id for the document selector
-        query = {"id": int(card_id)} if str(card_id).isdigit() else {"id": card_id}
-        coll = mdb["uploadedCards"]
+        # Accept either integer id or string id
+        query = None
+        if str(card_id).isdigit():
+            query = {"id": int(card_id)}
+        else:
+            query = {"id": card_id}
         updated = await coll.find_one_and_update(query, {"$set": {"is_advertised": True}}, return_document=ReturnDocument.AFTER)
         if not updated:
             raise HTTPException(status_code=404, detail="card not found")

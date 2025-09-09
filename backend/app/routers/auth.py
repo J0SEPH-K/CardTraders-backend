@@ -66,14 +66,21 @@ async def login(payload: LoginRequest, mdb=Depends(get_mongo_db)):
     doc.pop("_id", None)
     doc.pop("password", None)
 
-    # Convert ObjectIds in starred_item -> strings
-    starred = []
-    for s in (doc.get("starred_item") or []):
+    # Convert ObjectIds in favorites -> strings
+    favorites_list = []
+    for s in (doc.get("favorites") or []):
         try:
-            starred.append(str(s) if isinstance(s, ObjectId) else str(s))
+            favorites_list.append(str(s) if isinstance(s, ObjectId) else str(s))
         except Exception:
             pass
-    doc["starred_item"] = starred
+    doc["favorites"] = favorites_list
+    
+    # Debug logging for login
+    username = doc.get("username", "Unknown")
+    print(f"=== DEBUG: User login - {username} ===")
+    print(f"User ID: {doc.get('userId')}")
+    print(f"Favorites being returned: {favorites_list}")
+    print("=" * 50)
 
     user_public = UserPublic(id=doc_id, **doc)
     return LoginResponse(user=user_public)
@@ -248,7 +255,7 @@ async def signup(payload: dict, mdb=Depends(get_mongo_db)):
         "address": address,
         "signup_date": datetime.now(timezone.utc).strftime("%Y/%m/%d"),
         "suggested_num": 0,
-        "starred_item": [],
+        "favorites": [],
         "messages": [],
         "premade_messages": [],
         "notification": True,
@@ -289,7 +296,7 @@ async def login_google(payload: dict, mdb=Depends(get_mongo_db)):
             "address": None,
             "signup_date": now.strftime("%Y/%m/%d"),
             "suggested_num": 0,
-            "starred_item": [],
+            "favorites": [],
             "messages": [],
             "premade_messages": [],
             "notification": True,
@@ -353,6 +360,24 @@ async def update_profile(payload: dict, mdb=Depends(get_mongo_db)):
         updates["phone_num"] = str(payload.get("phone_num") or "").strip()
     if "address" in payload:
         updates["address"] = str(payload.get("address") or "").strip()
+    # Favorites
+    if "favorites" in payload:
+        v = payload.get("favorites")
+        if v is None:
+            updates["favorites"] = []
+        elif isinstance(v, list):
+            cleaned = []
+            for item in v:
+                try:
+                    cleaned.append(str(item))
+                except Exception:
+                    pass
+            updates["favorites"] = cleaned
+        else:
+            try:
+                updates["favorites"] = [str(v)]
+            except Exception:
+                updates["favorites"] = []
     # Bank account (optional)
     if "bank_acc" in payload:
         # Allow clearing by sending null/empty
@@ -403,6 +428,14 @@ async def update_profile(payload: dict, mdb=Depends(get_mongo_db)):
     if not updates:
         # Nothing to change
         # Return current doc as UserPublic
+        # Convert ObjectIds in starred_item -> strings for safety
+        starred = []
+        for s in (user_doc.get("starred_item") or []):
+            try:
+                starred.append(str(s) if isinstance(s, ObjectId) else str(s))
+            except Exception:
+                pass
+        user_doc["starred_item"] = starred
         doc_id = str(user_doc.get("_id")) if user_doc.get("_id") else None
         out = user_doc.copy()
         out.pop("_id", None)
