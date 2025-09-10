@@ -13,7 +13,7 @@ services:
         value: 3.11
       # Flip to "true" after configuring MongoDB Atlas and MONGODB_URI
       - key: MONGO_ENABLED
-        value: "false"
+        value: "false" 
       # Optional: use a managed DB in production; this keeps sqlite for now
       - key: DATABASE_URL
         value: "sqlite:///./app.db"
