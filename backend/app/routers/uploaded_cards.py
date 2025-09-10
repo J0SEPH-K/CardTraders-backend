@@ -301,7 +301,7 @@ async def create_uploaded_card(payload: Dict[str, Any], mdb=Depends(get_mongo_db
     # If pokemon or yugioh, accept extra fields
     if category in {"pokemon", "yugioh"}:
         # Accept common fields, including variants (and forgiving misspelling varients)
-        for key in ["card_name", "rarity", "language", "set", "card_num", "variants"]:
+        for key in ["card_name", "rarity", "language", "set", "card_num", "variants", "quality_rating"]:
             if key in payload:
                 doc[key] = payload[key]
         # handle misspelling 'varients' by mapping to 'variants' if not already set
@@ -491,3 +491,55 @@ async def get_uploaded_card(card_id: int, mdb=Depends(get_mongo_db)) -> Dict[str
     if not doc:
         raise HTTPException(status_code=404, detail="not found")
     return _normalize_uploaded_card(doc)
+
+@router.put("/{card_id}")
+async def update_uploaded_card(card_id: int, payload: Dict[str, Any], mdb=Depends(get_mongo_db)) -> Dict[str, Any]:
+    """Update an uploaded card's metadata"""
+    if not mongo_enabled() or mdb is None:
+        raise HTTPException(status_code=503, detail="Requires MongoDB")
+    
+    # Build update fields, filtering out None/empty values
+    update_fields = {}
+    
+    # Handle possible field mappings
+    field_mappings = {
+        "card_name": ["card_name", "title"],
+        "description": ["description"],
+        "price": ["price"],
+        "set": ["set"],
+        "rarity": ["rarity"],
+        "language": ["language"],
+        "card_num": ["card_num", "cardNum"],
+        "quality_rating": ["quality_rating", "qualityRating"]
+    }
+    
+    for db_field, possible_keys in field_mappings.items():
+        for key in possible_keys:
+            if key in payload and payload[key] is not None:
+                if key == "price":
+                    # Convert price to number
+                    try:
+                        update_fields[db_field] = float(payload[key])
+                    except (ValueError, TypeError):
+                        continue
+                else:
+                    # For string fields, only update if not empty
+                    value = str(payload[key]).strip()
+                    if value:
+                        update_fields[db_field] = value
+                break
+    
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Perform the update
+    result = await mdb["uploadedCards"].find_one_and_update(
+        {"id": int(card_id)},
+        {"$set": update_fields},
+        return_document=ReturnDocument.AFTER
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Card not found")
+    
+    return _normalize_uploaded_card(result)

@@ -8,9 +8,12 @@ from .routers import images
 from .routers import tcgdex
 from .routers import chats
 from .routers import payments
+from .routers import quality_ratings
 from .db import Base, engine
 from . import models  # noqa: F401
 from .mongo import mongo_enabled, get_mongo_db
+from .routers import config as config_router
+from .config import load_server_config_from_mongo
 
 app = FastAPI(title="CardTraders API")
 logger = logging.getLogger("uvicorn.error")
@@ -27,12 +30,14 @@ app.add_middleware(
 app.include_router(health.router, prefix="/health", tags=["health"])
 app.include_router(listings.router, prefix="/listings", tags=["listings"])
 app.include_router(catalog.router, prefix="/catalog", tags=["catalog"])
-app.include_router(tcgdex.router, prefix="/tcgdex", tags=["tcgdex"])
+app.include_router(tcgdex.router, prefix="/tcgdx", tags=["tcgdx"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(uploaded_cards.router, prefix="/uploaded-cards", tags=["uploaded-cards"])
 app.include_router(images.router, prefix="/images", tags=["images"])
 app.include_router(chats.router, prefix="/chats", tags=["chats"])
 app.include_router(payments.router, prefix="/payments", tags=["payments"])
+app.include_router(quality_ratings.router, prefix="/quality-ratings", tags=["quality-ratings"])
+app.include_router(config_router.router, prefix="/config", tags=["config"]) 
 
 # Create tables & log DB connectivity on startup (simple dev setup; use Alembic in prod)
 @app.on_event("startup")
@@ -72,6 +77,11 @@ async def on_startup():
 			if mdb is None:
 				raise RuntimeError("Mongo client not available")
 			await mdb.command("ping")
+			# Load server config from Mongo at startup
+			try:
+				await load_server_config_from_mongo(mdb)
+			except Exception as ce:
+				logger.warning("Loading server config failed: %s", ce)
 			# Ensure chat indexes
 			try:
 				from .routers.chats import ensure_indexes
@@ -85,8 +95,18 @@ async def on_startup():
 
 	# Probe SQLAlchemy engine
 	try:
-		with engine.connect() as conn:
-			conn.execute(text("SELECT 1"))
-		logger.info("Database connected: SQLAlchemy engine OK")
+		with engine.begin() as c:
+			c.execute(text("SELECT 1"))
+		logger.info("Database connected: SQL")
 	except Exception as e:
-		logger.warning("No database connection established; using in-memory fallback. Detail: %s", e)
+		logger.warning("SQL DB connection failed: %s", e)
+
+
+@app.get("/")
+def read_root():
+	return {"message": "CardTraders API is running"}
+
+
+if __name__ == "__main__":
+	import uvicorn
+	uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -29,6 +29,7 @@ class UserPublic(BaseModel):
     blocked_users: List[str] = []
     pfp: Optional[Pfp] = None
     bank_acc: Optional[str] = None
+    terms_and_conditions: Optional[bool] = False
 
 
 class LoginResponse(BaseModel):

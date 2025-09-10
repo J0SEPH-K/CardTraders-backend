@@ -453,6 +453,76 @@ async def update_profile(payload: dict, mdb=Depends(get_mongo_db)):
     return {"user": UserPublic(id=doc_id, **out)}
 
 
+@router.post("/accept-terms", response_model=LoginResponse)
+async def accept_terms_and_conditions(payload: dict, mdb=Depends(get_mongo_db)):
+    """Accept terms and conditions for a user"""
+    if not mongo_enabled() or mdb is None:
+        # For testing without MongoDB, return a mock user response
+        log.warning("accept-terms called without MongoDB - returning mock response")
+        mock_user = {
+            "id": payload.get("userId", "test-user-id"),
+            "userId": payload.get("userId", "test-user-id"),
+            "email": "test@example.com",
+            "username": "testuser",
+            "terms_and_conditions": True,
+            "createdAt": "2025-01-01T00:00:00Z",
+            "updatedAt": "2025-01-01T00:00:00Z"
+        }
+        return {"user": UserPublic(**mock_user)}
+    
+    users = mdb["users"]
+    # Identify user by id (Mongo _id) or userId or email
+    user_doc = None
+    q = None
+    id_str = payload.get("id")
+    user_id = payload.get("userId")
+    email = (payload.get("email") or "").strip().lower() or None
+    
+    if id_str:
+        try:
+            q = {"_id": ObjectId(id_str)}
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid id")
+    elif user_id:
+        q = {"userId": str(user_id)}
+    elif email:
+        q = {"email": email}
+    else:
+        raise HTTPException(status_code=400, detail="missing identifier (id, userId, or email)")
+
+    user_doc = await users.find_one(q)
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    # Update the terms_and_conditions field
+    now = datetime.now(timezone.utc)
+    updates = {
+        "terms_and_conditions": True,
+        "terms_accepted_at": now,
+        "updatedAt": now
+    }
+    
+    await users.update_one({"_id": user_doc["_id"]}, {"$set": updates})
+    user_doc.update(updates)
+    
+    # Return updated user
+    doc_id = str(user_doc.get("_id")) if user_doc.get("_id") else None
+    out = user_doc.copy()
+    out.pop("_id", None)
+    out.pop("password", None)
+    
+    # Convert ObjectIds in starred_item -> strings for safety
+    starred = []
+    for s in (out.get("starred_item") or []):
+        try:
+            starred.append(str(s) if isinstance(s, ObjectId) else str(s))
+        except Exception:
+            pass
+    out["starred_item"] = starred
+    
+    return {"user": UserPublic(id=doc_id, **out)}
+
+
 @router.post("/complete-profile-google", response_model=LoginResponse)
 async def complete_profile_google(payload: dict, mdb=Depends(get_mongo_db)):
     if not mongo_enabled() or mdb is None:
