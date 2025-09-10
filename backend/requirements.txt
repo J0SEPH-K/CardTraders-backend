@@ -7,3 +7,10 @@ python-multipart
 openpyxl
 motor
 python-dotenv
+httpx
+google-auth
+requests
+bcrypt
+twilio
+sendgrid
+solapi
